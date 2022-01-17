@@ -474,6 +474,23 @@ Resources:
           mount -t efs ${Efs}:/ /opt/minecraft
           chown 845:845 /opt/minecraft
 
+  LaunchConfigurationPortKnock:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      AssociatePublicIpAddress: true
+      IamInstanceProfile: !Ref InstanceProfile
+      ImageId: !Ref ECSAMI
+      InstanceType: t3.nano
+      KeyName:
+        !If [ KeyPairNameProvided, !Ref KeyPairName, !Ref 'AWS::NoValue' ]
+      SecurityGroups:
+      - !Ref Ec2Sg
+      SpotPrice: 0.003
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          echo ECS_CLUSTER=${EcsCluster} >> /etc/ecs/ecs.config
+
   AutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     DependsOn:
@@ -486,6 +503,24 @@ Resources:
       NewInstancesProtectedFromScaleIn: true
       MaxSize: 1
       MinSize: 0
+      VPCZoneIdentifier:
+        - !Ref SubnetA
+        - !Ref SubnetB
+    Metadata:
+      LaunchEvent: !If [ DnsConfigEnabled, !GetAtt LaunchEvent.Arn, "" ]
+
+  AutoScalingGroupPortKnock:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+    - MountA
+    - MountB
+    Properties:
+      AutoScalingGroupName: !Sub "${AWS::StackName}-port-knock-asg"
+      DesiredCapacity: 1
+      LaunchConfigurationName: !Ref LaunchConfigurationPortKnock
+      NewInstancesProtectedFromScaleIn: true
+      MaxSize: 1
+      MinSize: 1
       VPCZoneIdentifier:
         - !Ref SubnetA
         - !Ref SubnetB
@@ -533,12 +568,20 @@ Resources:
           TargetCapacity: 100
         ManagedTerminationProtection: ENABLED
 
+  ECSCapacityProviderPortKnock:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref AutoScalingGroupPortKnock
+        ManagedTerminationProtection: ENABLED
+
   EcsClusterCapacityProviderAssociation:
     Type: AWS::ECS::ClusterCapacityProviderAssociations
     Properties:
       Cluster: !Ref EcsCluster
       CapacityProviders:
         - !Ref ECSCapacityProvider
+        - !Ref ECSCapacityProviderPortKnock
       DefaultCapacityProviderStrategy:
         - CapacityProvider: !Ref ECSCapacityProvider
           Weight: 1
@@ -552,6 +595,21 @@ Resources:
       TaskDefinition: !Ref EcsTask  
       CapacityProviderStrategy:
         - CapacityProvider: !Ref ECSCapacityProvider
+          Weight: 1
+          Base: 0
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+
+  EcsServicePortKnock:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref EcsCluster
+      DesiredCount: 1
+      ServiceName: !Sub "${AWS::StackName}-port-knock-ecs-service"
+      TaskDefinition: !Ref EcsTaskPortKnock
+      CapacityProviderStrategy:
+        - CapacityProvider: !Ref ECSCapacityProviderPortKnock
           Weight: 1
           Base: 0
       DeploymentConfiguration:
@@ -699,12 +757,82 @@ Resources:
               ECS_PROMETHEUS_EXPORTER_PORT: 8080
               ECS_PROMETHEUS_JOB_NAME: "minecraft"
           - !Ref 'AWS::NoValue'
+
   CloudWatchLogGroup:
     Condition: LogGroupNameProvided
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "${LogGroupName}"
       RetentionInDays: !Sub "${LogGroupRetentionInDays}"
+
+  PortKnockTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ecs-tasks.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: ecs:UpdateService
+                Resource: !Ref EcsService
+              - Effect: "Allow"
+                Action: autoscaling:SetDesiredCapacity
+                Resource: !Sub "arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-asg"
+
+  EcsTaskPortKnock:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      NetworkMode: "bridge"
+      TaskRoleArn: !Ref PortKnockTaskRole
+      ContainerDefinitions:
+        - Name: mc-port-knock
+          MemoryReservation: 128
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/mc-port-knock:latest"
+          PortMappings:
+          - ContainerPort: 25565
+            HostPort: 25565
+            Protocol: tcp
+          LogConfiguration:
+            !If
+            - LogGroupNameProvided
+            - LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref CloudWatchLogGroup
+                awslogs-stream-prefix: !If
+                - LogStreamPrefixProvided
+                - !Sub ${LogStreamPrefix}
+                - !Ref 'AWS::NoValue'
+                awslogs-region: !Ref AWS::Region
+                awslogs-create-group: true
+            - !Ref 'AWS::NoValue'
+          Environment:
+            - Name: "MC_PORT_KNOCK_CONFIG_BASE64"
+              Value:
+                Fn::Base64: !Sub |
+                  {
+                    "server": "server.mc.brettrandall.com",
+                    "port": 25565,
+
+                    "emptyThreshold": 180,
+                    "checkRate": 60,
+
+                    "startCommand": "export AWS_DEFAULT_REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone | sed 's/.$//');aws autoscaling set-desired-capacity --auto-scaling-group-name ${AWS::StackName}-asg --desired-capacity 1;aws ecs update-service --cluster ${AWS::StackName}-cluster --service arn:aws:ecs:ap-southeast-2:${AWS::AccountId}:service/${AWS::StackName}-cluster/${AWS::StackName}-ecs-service --desired-count 1;",
+                    "stopCommand": "export AWS_DEFAULT_REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone | sed 's/.$//');aws autoscaling set-desired-capacity --auto-scaling-group-name ${AWS::StackName}-asg --desired-capacity 0;aws ecs update-service --cluster ${AWS::StackName}-cluster --service arn:aws:ecs:ap-southeast-2:${AWS::AccountId}:service/${AWS::StackName}-cluster/${AWS::StackName}-ecs-service --desired-count 0;",
+
+                    "clientError": "Server Paused... Starting Now! Please reconnect in 2 minutes",
+                    "serverTitle": "A Minecraft Server",
+                    "serverMaxPlayers": "500"
+                  }
 
   # ====================================================
   # SET DNS RECORD
@@ -750,26 +878,38 @@ Resources:
           import boto3
           import os
           def handler(event, context):
+            print('## EVENT' + event)
             new_instance = boto3.resource('ec2').Instance(event['detail']['EC2InstanceId'])
+            record_name = os.environ['RecordName']
+            failover = "SECONDARY"
+            changes = [
+                {
+                    'Action': 'UPSERT',
+                    'ResourceRecordSet': {
+                        'Type': 'A',
+                        'TTL': 60,
+                        'ResourceRecords': [
+                            {
+                                'Value': new_instance.public_ip_address
+                            },
+                        ]
+                    }
+                },
+            ]
+
+            if "port-knock" in event['detail']['AutoScalingGroupName']:
+              changes[0]['ResourceRecordSet']['Name'] = record_name
+              changes[0]['ResourceRecordSet']['Failover'] = "SECONDARY"
+              changes[0]['ResourceRecordSet']['SetIdentifier'] = "SECONDARY"
+            else:
+              changes[0]['ResourceRecordSet']['Name'] = "server." + record_name
+
+            print('Updating with changes {}'.format(changes))
             boto3.client('route53').change_resource_record_sets(
               HostedZoneId= os.environ['HostedZoneId'],
               ChangeBatch={
                   'Comment': 'updating',
-                  'Changes': [
-                      {
-                          'Action': 'UPSERT',
-                          'ResourceRecordSet': {
-                              'Name': os.environ['RecordName'],
-                              'Type': 'A',
-                              'TTL': 60,
-                              'ResourceRecords': [
-                                  {
-                                      'Value': new_instance.public_ip_address
-                                  },
-                              ]
-                          }
-                      },
-                  ]
+                  'Changes': changes
               })
       Description: Sets Route 53 DNS Record for Minecraft
       FunctionName: !Sub "${AWS::StackName}-set-dns"
@@ -791,6 +931,7 @@ Resources:
         detail:
           AutoScalingGroupName:
           - !Sub "${AWS::StackName}-asg"
+          - !Sub "${AWS::StackName}-port-knock-asg"
       Name: !Sub "${AWS::StackName}-instance-launch"
       State: ENABLED
       Targets:
