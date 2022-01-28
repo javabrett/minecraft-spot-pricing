@@ -33,6 +33,14 @@ Parameters:
     - enabled
     - disabled
 
+  McMonitor:
+    Type: String
+    Description: "Enable/Disable mc-monitor in Prometheus export mode"
+    Default: disabled
+    AllowedValues:
+    - enabled
+    - disabled
+
   EntryPoint:
     Type: CommaDelimitedList
     Description: "Task entrypoint (Optional - image default is script /start)"
@@ -203,6 +211,7 @@ Metadata:
           default: Optional ECS Cluster and Task Configuration
         Parameters:
         - ContainerInsights
+        - McMonitor
         - EntryPoint
         - Command
         - LogGroupName
@@ -240,6 +249,8 @@ Metadata:
         default: "Minecraft version ie 1.16.3"
       ContainerInsights:
         default: "ECS Container Insights provide additional container metrics, and supports collection of Prometheus metrics.  Additional AWS charges may apply."
+      McMonitor:
+        default: "Enable mc-monitor to deploy it in Prometheus export mode, to track some MC server metrics"
       EntryPoint:
         default: "Task/container --entrypoint, comma separated e.g. /bin/bash,-c"
       Command:
@@ -300,7 +311,7 @@ Conditions:
   LevelTypeProvided: !Not [ !Equals [ !Ref LevelType, '' ] ]
   EnableRollingLogsProvided: !Not [ !Equals [ !Ref EnableRollingLogs, '' ] ]
   TimezoneProvided: !Not [ !Equals [ !Ref Timezone, '' ] ]
-
+  McMonitorEnabled: !Equals [ !Ref McMonitor, 'enabled' ]
 
 Mappings:
   ServerState:
@@ -656,7 +667,38 @@ Resources:
               - Name: "TZ"
                 Value: !Sub "${Timezone}"
               - !Ref 'AWS::NoValue'
-
+        - !If
+          - McMonitorEnabled
+          - Name: mc-monitor
+            MemoryReservation: 64
+            Image: "itzg/mc-monitor"
+            Command:
+              - "export-for-prometheus"
+              - "-servers"
+              - "minecraft"
+            PortMappings:
+            - ContainerPort: 8080
+              HostPort: 8080
+              Protocol: tcp
+            Links:
+              - "minecraft:minecraft"
+            LogConfiguration:
+              !If
+              - LogGroupNameProvided
+              - LogDriver: awslogs
+                Options:
+                  awslogs-group: !Ref CloudWatchLogGroup
+                  awslogs-stream-prefix: !If
+                  - LogStreamPrefixProvided
+                  - !Sub ${LogStreamPrefix}
+                  - !Ref 'AWS::NoValue'
+                  awslogs-region: !Ref AWS::Region
+                  awslogs-create-group: true
+              - !Ref 'AWS::NoValue'
+            DockerLabels:
+              ECS_PROMETHEUS_EXPORTER_PORT: 8080
+              ECS_PROMETHEUS_JOB_NAME: "minecraft"
+          - !Ref 'AWS::NoValue'
   CloudWatchLogGroup:
     Condition: LogGroupNameProvided
     Type: AWS::Logs::LogGroup
